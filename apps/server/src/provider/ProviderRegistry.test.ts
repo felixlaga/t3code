@@ -5,12 +5,15 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, it, assert, expect } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
@@ -296,6 +299,98 @@ function layerHangingScopedSpawner(killCalls: Ref.Ref<number>) {
         });
         yield* Effect.addFinalizer(() => handle.kill().pipe(Effect.ignore));
         return handle;
+      }),
+    ),
+  );
+}
+
+/** What the fake app-server below answers each Codex method with. */
+const codexAppServerAnswers: Readonly<Record<string, object>> = {
+  initialize: {
+    result: {
+      userAgent: "codex/0.163.0",
+      codexHome: "/codex-home",
+      platformFamily: "unix",
+      platformOs: "macos",
+    },
+  },
+  "account/read": {
+    result: {
+      account: { type: "chatgpt", email: "test@example.com", planType: "pro" },
+      requiresOpenaiAuth: false,
+    },
+  },
+  "skills/list": { result: { data: [] } },
+  "model/list": {
+    result: {
+      data: [
+        {
+          id: "gpt-6.1-sol",
+          model: "gpt-6.1-sol",
+          displayName: "GPT-6.1 Sol",
+          description: "",
+          hidden: false,
+          isDefault: true,
+          defaultReasoningEffort: "high",
+          supportedReasoningEfforts: [{ reasoningEffort: "high", description: "" }],
+          serviceTiers: [],
+        },
+      ],
+      nextCursor: null,
+    },
+  },
+  "account/rateLimits/read": { error: { code: -32601, message: "unsupported" } },
+};
+
+/**
+ * A Codex app-server whose answers take the time `delays` gives them on the test clock, one
+ * delay per request to a method, in order. A request past its method's delays never answers.
+ */
+function layerSlowCodexAppServer(delays: Readonly<Record<string, ReadonlyArray<Duration.Input>>>) {
+  return Layer.succeed(
+    ChildProcessSpawner.ChildProcessSpawner,
+    ChildProcessSpawner.make(() =>
+      Effect.gen(function* () {
+        const scope = yield* Effect.scope;
+        const stdout = yield* Queue.unbounded<Uint8Array>();
+        const decoder = new TextDecoder();
+        const requests = new Map<string, number>();
+        let partialLine = "";
+        const answer = (line: string) => {
+          const { id, method } = JSON.parse(line) as {
+            readonly id?: number;
+            readonly method: string;
+          };
+          const index = requests.get(method) ?? 0;
+          requests.set(method, index + 1);
+          const delay = delays[method]?.[index];
+          if (id === undefined || delay === undefined) return Effect.void;
+          const reply = encoder.encode(
+            `${JSON.stringify({ id, ...codexAppServerAnswers[method] })}\n`,
+          );
+          return Effect.sleep(delay).pipe(
+            Effect.andThen(Queue.offer(stdout, reply)),
+            Effect.forkIn(scope),
+            Effect.asVoid,
+          );
+        };
+        return ChildProcessSpawner.makeHandle({
+          pid: ChildProcessSpawner.ProcessId(1),
+          exitCode: Effect.never,
+          isRunning: Effect.succeed(true),
+          kill: () => Effect.void,
+          unref: Effect.succeed(Effect.void),
+          stdin: Sink.forEach((chunk: Uint8Array) => {
+            const lines = (partialLine + decoder.decode(chunk, { stream: true })).split("\n");
+            partialLine = lines.pop() ?? "";
+            return Effect.forEach(lines, answer, { discard: true });
+          }),
+          stdout: Stream.fromQueue(stdout),
+          stderr: Stream.never,
+          all: Stream.never,
+          getInputFd: () => Sink.drain,
+          getOutputFd: () => Stream.empty,
+        });
       }),
     ),
   );
@@ -623,6 +718,66 @@ it.layer(
           "Timed out while checking Codex app-server provider status.",
         );
         assert.strictEqual(yield* Ref.get(killCalls), 1);
+      }),
+    );
+
+    it.effect("keeps the account read when it leaves no time to refresh the catalog (#20431)", () =>
+      Effect.gen(function* () {
+        // The timings from the report: the account read and the first model list end 18.2s
+        // in, too late to wait for a fresh catalog before the probe's deadline.
+        const statusFiber = yield* checkCodexProviderStatus(defaultCodexSettings).pipe(
+          Effect.provide(
+            layerSlowCodexAppServer({
+              initialize: ["500 millis"],
+              "account/read": ["12700 millis"],
+              "skills/list": ["100 millis"],
+              "model/list": ["5 seconds"],
+              "account/rateLimits/read": ["100 millis"],
+            }),
+          ),
+          Effect.forkChild,
+        );
+
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust("21 seconds");
+
+        const status = yield* Fiber.join(statusFiber);
+        assert.strictEqual(status.status, "ready");
+        assert.strictEqual(status.auth.status, "authenticated");
+        assert.isTrue(status.models.some((model) => model.slug === "gpt-6.1-sol"));
+      }),
+    );
+
+    it.effect("keeps the first catalog when the refreshed one is not listed in time", () =>
+      Effect.gen(function* () {
+        const statusFiber = yield* checkCodexProviderStatus(defaultCodexSettings).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              layerSlowCodexAppServer({
+                initialize: ["500 millis"],
+                "account/read": ["1 second"],
+                "skills/list": ["100 millis"],
+                // The second list, after the refresh lands, never answers.
+                "model/list": ["1 second"],
+                "account/rateLimits/read": ["100 millis"],
+              }),
+              // App-server wrote a catalog after the probe spawned it.
+              FileSystem.layerNoop({
+                readFileString: () =>
+                  Effect.succeed(JSON.stringify({ fetched_at: "2026-10-17T00:00:00.000Z" })),
+              }),
+            ),
+          ),
+          Effect.forkChild,
+        );
+
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust("21 seconds");
+
+        const status = yield* Fiber.join(statusFiber);
+        assert.strictEqual(status.status, "ready");
+        assert.strictEqual(status.auth.status, "authenticated");
+        assert.isTrue(status.models.some((model) => model.slug === "gpt-6.1-sol"));
       }),
     );
   });

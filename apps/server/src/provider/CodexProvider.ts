@@ -75,6 +75,10 @@ const CODEX_CLIENT_NAME = "T3 Code";
 // (most often reported on Windows). Give Codex its own longer budget instead of raising the
 // timeout for every provider.
 const CODEX_AUTH_PROBE_TIMEOUT_MS = 20_000;
+// When the optional catalog refresh must be done, counted from spawn. It leaves the rest of the
+// probe's budget for app-server to stop, which can take the whole force-kill window.
+const CODEX_CATALOG_REFRESH_DEADLINE_MS =
+  CODEX_AUTH_PROBE_TIMEOUT_MS - Duration.toMillis(CODEX_APP_SERVER_PROBE_FORCE_KILL_AFTER);
 
 const CODEX_PRESENTATION = {
   displayName: "Codex",
@@ -356,12 +360,11 @@ const readCodexModelsCacheFetchedAt = Effect.fn("readCodexModelsCacheFetchedAt")
  * Ultrafast. App-server refreshes the catalog online at startup, so wait until
  * a write newer than this process's spawn lands, then list again.
  */
-const requestCodexChatGptModels = Effect.fn("requestCodexChatGptModels")(function* (input: {
+const refreshCodexChatGptModels = Effect.fn("refreshCodexChatGptModels")(function* (input: {
   readonly client: CodexClient.CodexAppServerClient["Service"];
   readonly codexHome: string;
   readonly spawnedAtMs: number;
 }) {
-  const models = yield* requestAllCodexModels(input.client);
   const refreshed = yield* readCodexModelsCacheFetchedAt(input.codexHome).pipe(
     Effect.repeat({
       schedule: Schedule.spaced(CODEX_CATALOG_REFRESH_POLL),
@@ -369,13 +372,36 @@ const requestCodexChatGptModels = Effect.fn("requestCodexChatGptModels")(functio
     }),
     Effect.timeoutOption(CODEX_CATALOG_REFRESH_TIMEOUT),
   );
+  if (Option.isNone(refreshed)) return Option.none<ReadonlyArray<ServerProviderModel>>();
+  return Option.some(yield* requestAllCodexModels(input.client));
+});
+
+/**
+ * The refresh only improves a catalog already in hand, so it gives up at `refreshBy`. Running
+ * into the probe's deadline would throw away that catalog and the account read before it.
+ */
+const requestCodexChatGptModels = Effect.fn("requestCodexChatGptModels")(function* (input: {
+  readonly client: CodexClient.CodexAppServerClient["Service"];
+  readonly codexHome: string;
+  readonly spawnedAtMs: number;
+  readonly refreshBy: number;
+}) {
+  const models = yield* requestAllCodexModels(input.client);
+  const timeLeftMs = input.refreshBy - DateTime.toEpochMillis(yield* DateTime.now);
+  const refreshed =
+    timeLeftMs > 0
+      ? yield* refreshCodexChatGptModels(input).pipe(
+          Effect.timeoutOption(Duration.millis(timeLeftMs)),
+          Effect.map(Option.flatten),
+        )
+      : Option.none<ReadonlyArray<ServerProviderModel>>();
   if (Option.isNone(refreshed)) {
     yield* Effect.logWarning(
       "Codex did not refresh its model catalog in time; using the cached catalog.",
     );
     return models;
   }
-  return yield* requestAllCodexModels(input.client);
+  return refreshed.value;
 });
 
 /**
@@ -486,7 +512,12 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
         cwds: [input.cwd],
       }),
       accountResponse.account?.type === "chatgpt"
-        ? requestCodexChatGptModels({ client, codexHome: initialize.codexHome, spawnedAtMs })
+        ? requestCodexChatGptModels({
+            client,
+            codexHome: initialize.codexHome,
+            spawnedAtMs,
+            refreshBy: spawnedAtMs + CODEX_CATALOG_REFRESH_DEADLINE_MS,
+          })
         : requestAllCodexModels(client),
       input.skipNativeUsage
         ? Effect.succeed(undefined)
